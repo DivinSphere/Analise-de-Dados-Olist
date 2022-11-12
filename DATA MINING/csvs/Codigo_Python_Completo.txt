@@ -1,0 +1,336 @@
+#Original file is located at
+#https://colab.research.google.com/drive/1mLS9YcrKVaoidK1RfK_PDee_6WwbN2DI
+
+
+#Autoriza o uso do Drive no código
+from google.colab import drive
+drive.mount('/content/drive')
+
+#Importa bibliioteca para calculo ideal de número de clusters automático para fazer o calculo dinámico na função
+!pip install autoelbow
+from autoelbow_rupakbob import autoelbow
+
+
+#bibliotecas para tratamentos de dados
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+# %matplotlib inline
+
+
+#Bibliotecas para clusterização
+from sklearn.cluster import KMeans
+from sklearn import metrics
+
+
+#Para análise de sentimentos
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import f1_score
+
+
+# instalar as dependências do PySpark
+!apt-get install openjdk-8-jdk-headless -qq > /dev/null
+!wget -q https://archive.apache.org/dist/spark/spark-2.4.4/spark-2.4.4-bin-hadoop2.7.tgz
+!tar xf spark-2.4.4-bin-hadoop2.7.tgz
+
+# configurar as variáveis de ambiente e o Spark
+import os
+
+os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-8-openjdk-amd64"
+os.environ["SPARK_HOME"] = "/content/spark-2.4.4-bin-hadoop2.7"
+
+!pip install -q findspark
+
+# tornar o pyspark "importável"
+import findspark
+findspark.init('spark-2.4.4-bin-hadoop2.7')
+
+# iniciar uma sessão local
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.master("local[*]").appName("DadosLoja").getOrCreate()
+
+#Criação das funções do projeto
+
+#Utiliza a função data para criar o Dataframe
+#parâmetro 1 - Deve ser inserido o caminho do arquivo csv a ser importado
+#parâmetro 2 - Deve ser inserido o separador dos dados que está sendo utilizado, normalmente ;
+#parâmetro 3 - o nome que a tabela vai receber virtualmente
+#parâmetro 4 - caso pretenda remover valores nulos utilizando-se de colunas específicas
+def data(caminho,separador=';',nome="df",remove_na=[]):
+
+  # cRealiza o carregamento dos dados
+  df = spark.read.csv(caminho, inferSchema=True, header=True, sep=separador)
+
+
+  for x in remove_na:
+    df=df.na.drop(subset=x)
+
+  # Cria ou substitui uma exibição temporária local por este DataFrame.
+  df.createOrReplaceTempView(nome)
+
+  # Returna o DataFrame criado
+  return df
+
+
+#Clusteriza dados, utilizando de duas colunas, uma para X e outra para Y através de uma consulta sql
+#Caso queira salvar os dados na tabela original virtual, coloque o nome dela em clusDest
+def xy(sql,clusDest="",n=0):
+
+  #para diminuir a randomicidade do algoritmo de clusterização
+  SEED=0
+  
+  #Obtem o nome das colunas da tabela
+  colunas=spark.sql(sql).select("*").columns 
+
+  #transforma os dados da tabela para variaveis
+  table= np.array(spark.sql(sql).select("*").collect()) 
+  flip=[list(i) for i in zip(*table)]
+
+  #criação do gráfico de dados normais
+  plt.scatter(flip[0], flip[1])
+  plt.title('Data', loc='left', fontsize=18)
+  plt.xlabel(colunas[0])
+  plt.ylabel(colunas[1])
+  marker=11
+  plt.show()
+
+
+  #Obtem um número ideal de clusters
+  data = list(zip(flip[0], flip[1]))
+  if (n<=0):
+    n =autoelbow.auto_elbow_search(data)
+
+  plt.title('Cluster', loc='left', fontsize=18)
+
+  #Criação do clusterizador
+  kmeans = KMeans(n_clusters=n,random_state=SEED)
+  kmeans.fit(data)
+
+  #Mostrar o gráfico clusterizado
+  points=plt.scatter(flip[0], flip[1], c=kmeans.labels_, alpha = 0.5)
+
+
+  plt.xlabel(colunas[0])
+  plt.ylabel(colunas[1])
+
+  plt.show()
+
+
+  #Caso um destino para o cluster seja dado, insere ele na tabela de destino
+  if (clusDest!=""):
+    spark.createDataFrame(pd.DataFrame(kmeans.labels_,columns=["cluster"])).createOrReplaceTempView("clus")
+    spark.sql("select ROW_NUMBER() OVER(ORDER BY (SELECT NULL)) AS id,* from clus").createOrReplaceTempView("clus")
+    spark.sql("select ROW_NUMBER() OVER(ORDER BY (SELECT NULL)) AS id,* from "+clusDest).drop("cluster").createOrReplaceTempView(clusDest)
+    spark.sql("SELECT A.*,B.cluster from "+clusDest+" A join clus B using(id)").drop("id").createOrReplaceTempView(clusDest)
+
+
+#Salva uma tabela através de uma consulta sql com um separador padrão de virgula
+def save(sql,separador=","):
+  spark.sql(sql).coalesce(1).write.option("header","true").option("sep",separador).mode("overwrite").csv("Data_Table")
+
+
+#Mostra as colunas de uma tabela
+def showColumns(table):
+  data=spark.sql("SELECT * from "+table)
+
+  print(table," : ",data.count())
+  print(data.columns,sep="")
+  print("")
+
+
+#Função que exibe um gráfico de barras da coluna escolhida
+def grafico(var,df,total=10):
+
+  dados=spark.sql("SELECT "+str(var)+" as nomes,count("+str(var)+") as qtds from "+df+" where "+var+"!='None' group by "+var+" order by qtds desc,nomes limit "+str(total))
+
+  nomes=[]
+  qtds=[]
+
+  #transforma os valores em vetor
+  for val in dados.select("nomes").collect(): nomes.extend(val)
+  for val in dados.select("qtds").collect(): qtds.extend(val)
+
+  #Prepara o visual do gráfico e plota ele
+  fig,ax = plt.subplots(figsize=(19,8))
+  
+  ax.barh(nomes,qtds,color=["orange","red","blue","yellow","gray","pink","Brown","green","lime","purple"])
+  ax.set_title(var,fontsize=18)
+
+  for idx, val in enumerate(qtds):
+    txt = val
+    y_coord=idx-0.1
+    x_coord=val
+
+    ax.text(x=x_coord,y=y_coord,s=txt,fontsize=16)
+
+  plt.show()
+
+#Função que exibe um gráfico de pizza da coluna escolhida
+def pizza(var,df,total=10):
+
+
+  dados=spark.sql("SELECT "+str(var)+" as nomes,count("+str(var)+") as qtds from "+df+" where "+var+"!='None' group by "+var+" order by qtds desc,nomes limit "+str(total))
+
+  nomes=[]
+  qtds=[]
+
+  #transforma os valores em vetor
+  for val in dados.select("nomes").collect(): nomes.extend(val)
+  for val in dados.select("qtds").collect(): qtds.extend(val)
+
+  #Prepara o visual do gráfico e plota ele
+  fig1, ax1 = plt.subplots()
+  ax1.pie(qtds,  labels=nomes, autopct='%1.1f%%',colors=["orange","red","blue","yellow","gray","pink","Brown","green","lime","purple"],
+          startangle=90)
+  ax1.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle.
+
+  plt.show()
+
+#Importa a data de todas as planilhas
+customers = data('/content/drive/MyDrive/COLLAB/Data/olist_customers_dataset.csv', separador=',', nome="customers")
+geolocation = data('/content/drive/MyDrive/COLLAB/Data/olist_geolocation_dataset.csv', separador=',', nome="geolocation_backup")
+order_items = data('/content/drive/MyDrive/COLLAB/Data/olist_order_items_dataset.csv', separador=',', nome="order_items")
+order_payments = data('/content/drive/MyDrive/COLLAB/Data/olist_order_payments_dataset.csv', separador=',', nome="order_payments")
+order_reviews = data('/content/drive/MyDrive/COLLAB/Data/olist_order_reviews_dataset.csv', separador=',', nome="order_reviews")
+orders = data('/content/drive/MyDrive/COLLAB/Data/olist_orders_dataset.csv', separador=',', nome="orders")
+products = data('/content/drive/MyDrive/COLLAB/Data/olist_products_dataset.csv', separador=',', nome="products",remove_na=["product_length_cm","product_height_cm"])
+sellers = data('/content/drive/MyDrive/COLLAB/Data/olist_sellers_dataset.csv', separador=',', nome="sellers")
+
+
+#Atualiza geolocation com Cod agrupando os códigos e tirando as médias de lat e lng
+spark.sql(
+"SELECT CONCAT(geolocation_state,'_',geolocation_zip_code_prefix) as cod,"+
+"avg(geolocation_lat) as lat,"+
+"avg(geolocation_lng) as lng"+
+" from geolocation_backup group by cod order by cod"
+).createOrReplaceTempView("geolocation")
+
+#Atualiza customers com cod,lat e long
+spark.sql("SELECT *,CONCAT(customer_state,'_',customer_zip_code_prefix) as cod from customers").createOrReplaceTempView("customers")
+spark.sql("SELECT * from customers A join geolocation B using(cod)").createOrReplaceTempView("customers")
+
+#Atualiza sellers com cod,lat e long
+spark.sql("SELECT *,CONCAT(seller_state,'_',seller_zip_code_prefix) as cod from sellers").createOrReplaceTempView("sellers")
+spark.sql("SELECT * from sellers A join geolocation B using(cod)").createOrReplaceTempView("sellers")
+
+save("SELECT * from customers")
+
+#Exemplo de como uma clusterização é retornada para a tabela de origem
+xy("select lat,lng from customers",clusDest="customers")
+
+#Mostra todas as colunas de cada tabela e suas respectivas quantidades de valores depois das alterações
+showColumns("order_items")
+showColumns("order_reviews")
+showColumns("order_payments")
+showColumns("orders")
+showColumns("customers")
+showColumns("products")
+showColumns("geolocation")
+showColumns("sellers")
+
+#@title Plotar gráficos de Maiores Valores
+data = ["sellers","seller_state"] #@param ["[\"order_reviews\",\"review_score\"]", "[\"customers\",\"customer_state\"]", "[\"sellers\",\"seller_state\"]", "[\"products\",\"product_category_name\"]"] {type:"raw"}
+tipo = "Barras" #@param ["Barras", "Pizza"]
+
+num=10
+
+if (tipo=="Pizza"):
+  pizza(data[1],data[0],total=num)
+else:
+  grafico(data[1],data[0],total=num)
+
+#Consulta dos maiores vendedores
+spark.sql("select seller_id,B.seller_state,count(*) as qtd,round(sum(price)) as Total_price,round(sum(freight_value)) as Total_freight_value from order_items A join sellers B using (seller_id) group by seller_id,seller_state order by Total_price desc").show(10,False)
+
+#Consulta dos maiores compradores
+spark.sql("select customer_id,customer_state,round(sum(price)) as Total_price,round(sum(freight_value)) as Total_freight_value from orders A join order_items B using (order_id) join customers C using (customer_id) group by customer_id,customer_state order by Total_price desc").show(10,False)
+
+#Consulta dos maiores produtos em vendas
+spark.sql("select product_id,product_category_name,count(*) as qtd,round(sum(price)) as Total_price,round(sum(freight_value)) as Total_freight_value from order_items A join products B using (product_id) group by product_id,product_category_name order by Total_price desc").show(10,False)
+
+#Consulta das categorias com maior valor de venda
+spark.sql("select product_category_name,count(*) as qtd,round(sum(price)) as Total_price,round(sum(freight_value)) as Total_freight_value from order_items A join products B using (product_id) group by product_category_name order by Total_price desc").show(10,False)
+
+#Estados com maiores registros na tabela de Geolocation
+spark.sql("select geolocation_state,count(*) as qtd,avg(geolocation_lat) as lat_avg,avg(geolocation_lng) as lng_avg from geolocation_backup group by geolocation_state order by qtd desc").show(10,False)
+
+#Consulta da tabela para utilizar na análise de sentimentos
+spark.sql("select int(review_score) as score,review_comment_message as txt from order_reviews where review_comment_message is not null and int(review_score) is not null order by score asc ").show(10,False)
+
+#Salva a tabela pra análise de sentimentos
+save("select int(review_score) as score,review_comment_message as txt from order_reviews where review_comment_message is not null and int(review_score) is not null order by score asc",separador=";")
+
+#Gerar arquivo de compras de cada cliente para apriori
+
+spark.sql("select order_id as id,order_item_id as num,product_id as item from order_items A join orders B using (order_id) order by order_id").createOrReplaceTempView("list")
+
+spark.sql("select A.*,B.product_category_name as category from list A join products B on (A.item=B.product_id)").createOrReplaceTempView("list")
+
+spark.sql("select count(DISTINCT item) as qtd,collect_set(item) as shop,collect_set(category) as categorys from list group by id having qtd>1 order by qtd desc").createOrReplaceTempView("shops")
+
+spark.sql("select * from shops").toPandas().to_csv("dados.csv", sep=';', index = False)
+
+#import da base para análise de sentimentos
+df = pd.read_csv("/content/drive/MyDrive/COLLAB/Data/analise_sentimentos.csv", on_bad_lines='skip',sep=";")
+
+#Criação e treinamento dos dados de teste
+vect = CountVectorizer(ngram_range=(1, 1))
+vect.fit(df.txt)
+text_vect = vect.transform(df.txt)
+
+X_train,X_test,y_train,y_test = train_test_split(
+text_vect,
+df.score,
+test_size = 0.3,
+random_state = 42
+)
+
+clf = LogisticRegression(random_state=0, solver='newton-cg')
+clf = clf.fit(X_train, y_train)
+
+#mostrar resultado de precisão
+y_prediction = clf.predict(X_test)
+f1 = f1_score(y_prediction, y_test, average='weighted')
+print("Score: ",f1)
+
+
+#plotar gráfico de matriz de confusão
+
+matrix=metrics.confusion_matrix(y_test, y_prediction)
+
+cm_display=metrics.ConfusionMatrixDisplay(confusion_matrix = matrix, display_labels = [1,2,3,4,5])
+
+cm_display.plot()
+plt.show()
+
+df.head(10)
+
+#@title Predizer sentimento
+
+comentario1 = "Odiei esse produto!" #@param {type:"string"}
+comentario2 = "\"Gostei bastante do conteudo do produto\"" #@param {type:"string"}
+comentario3 = "produto muito ruim :C" #@param {type:"string"}
+comentario4 = "O preco estava otimo" #@param {type:"string"}
+comentario5 = "Achei o produto bem p\xE9ssimo" #@param {type:"string"}
+
+
+dados=pd.DataFrame({'col1': [comentario1,comentario2,comentario3,comentario4,comentario5]})
+
+
+predizer = vect.transform(dados.col1)
+
+
+sentimentos=["Negativo-","Negativo","Neutro","Positivo","Positivo+"]
+
+print("(",sentimentos[clf.predict(predizer)[0]-1],")",comentario1)
+
+print("\n(",sentimentos[clf.predict(predizer)[1]-1],")",comentario2)
+
+print("\n(",sentimentos[clf.predict(predizer)[2]-1],")",comentario3)
+
+print("\n(",sentimentos[clf.predict(predizer)[3]-1],")",comentario4)
+
+print("\n(",sentimentos[clf.predict(predizer)[4]-1],")",comentario5)

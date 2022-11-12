@@ -1,0 +1,17 @@
+install.packages("arules")
+library(arules)
+
+# Arquivo= "C:/Users/leloe/Desktop/apriori_itens.csv";
+Arquivo= "C:/Users/leloe/Desktop/apriori_categorys.csv";
+
+transacoes <- read.transactions(
+  file= Arquivo
+  , sep = ","
+  , format="basket"
+  , header = TRUE
+
+)
+
+regras <- apriori(transacoes, parameter= list(minlen=2, supp=0.01, conf=0.01))
+
+inspect(regras)
